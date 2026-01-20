@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>FastAPI WS Control - Step 1</title>
+  <style>
+    html, body { height: 100%; }
+    body { font-family: sans-serif; margin: 0; padding: 16px; box-sizing: border-box; overflow: hidden; }
+    h2 { margin: 8px 0; }
+    .row { margin: 10px 0; }
+    .controls-row, .props-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .controls-row button { padding: 8px 12px; }
+    .props-row .prop { display: flex; align-items: center; gap: 8px; }
+    .props-row input[type="range"] { width: 220px; }
+    #status { margin-left: 8px; font-weight: 600; }
+
+    /* Layout: no browser scroll; viewer fills remaining height */
+    #page { height: calc(100vh - 32px); display: flex; flex-direction: column; gap: 8px; }
+    #top { flex: 0 0 auto; }
+    #viewerSection { flex: 1 1 auto; min-height: 160px; display: flex; flex-direction: column; gap: 6px; }
+    #viewerWrap { flex: 1 1 auto; border: 1px solid #ddd; padding: 8px; background: #000; box-sizing: border-box; }
+    #viewerBox { width: 100%; height: 100%; background: #000; display: flex; align-items: center; justify-content: center; }
+    #viewer { width: 100%; height: 100%; object-fit: contain; }
+
+    #logWrap { flex: 0 0 auto; }
+    #log { width: 100%; height: 120px; box-sizing: border-box; }
+  </style>
+</head>
+<body>
+  <div id="page">
+  <div class="row controls-row">
+    <button id="btnConnect">Connect</button>
+    <button id="btnDisconnect" disabled>Disconnect</button>
+    <button id="btnStart" disabled>Camera Start</button>
+    <button id="btnStop" disabled>Camera Stop</button>
+    <span id="status">DISCONNECTED</span>
+  </div>
+    <div id="viewerSection">
+    <div class="row props-row">
+    <div class="prop">
+      <label>Exposure: <span id="expVal">250</span></label>
+      <input id="exposure" type="range" min="3" max="2047" value="50" disabled />
+    </div>
+    <div class="prop">
+      <label>Focus: <span id="focusVal">50</span></label>
+      <input id="focus" type="range" min="0" max="255" value="50" disabled />
+    </div>
+    <div class="prop">
+      <label>Gain: <span id="gainVal">10</span></label>
+      <input id="gain" type="range" min="0" max="255" value="10" disabled />
+    </div>
+  </div>
+
+
+  <div class="row">
+    <div id="viewerWrap">
+      <div id="viewerBox">
+        <img id="viewer" alt="MJPEG Stream" src="" />
+      </div>
+    </div>
+    <div style="font-size: 12px; color: #666; margin-top: 6px;">
+      Tip: Click <b>Camera Start</b> to begin streaming; <b>Camera Stop</b> to stop and release the HTTP stream.
+    </div>
+  </div>
+    </div>
+    <div id="logWrap">
+  <div class="row">
+    <textarea id="log" readonly></textarea>
+  </div>
+    </div>
+  </div>
+<script>
+    let ws = null;
+    let pendingStartStream = false;
+    const btnConnect = document.getElementById("btnConnect");
+    const btnDisconnect = document.getElementById("btnDisconnect");
+    const btnStart = document.getElementById("btnStart");
+    const btnStop = document.getElementById("btnStop");
+    const exposure = document.getElementById("exposure");
+    const expVal = document.getElementById("expVal");
+    const statusEl = document.getElementById("status");
+    const focus = document.getElementById("focus");
+    const focusVal = document.getElementById("focusVal");
+    const gain = document.getElementById("gain");
+    const gainVal = document.getElementById("gainVal");
+    const logEl = document.getElementById("log");
+    const viewerImg = document.getElementById("viewer");
+
+    function log(line) {
+      logEl.value += line + "\n";
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function applyState(state) {
+      // state: "disconnected" | "connected_idle" | "streaming" | "connected_poststop"
+      const connected = (state !== "disconnected");
+
+      // Buttons layout/enable rules per your spec
+      if (state === "disconnected") {
+        btnConnect.disabled = false;
+        btnDisconnect.disabled = true;
+        btnStart.disabled = true;
+        btnStop.disabled = true;
+        statusEl.textContent = "DISCONNECTED";
+      } else if (state === "connected_idle") {
+        btnConnect.disabled = true;
+        btnDisconnect.disabled = false;
+        btnStart.disabled = false;
+        btnStop.disabled = true;
+        statusEl.textContent = "CONNECTED";
+      } else if (state === "streaming") {
+        btnConnect.disabled = true;
+        btnDisconnect.disabled = true;
+        btnStart.disabled = true;
+        btnStop.disabled = false;
+        statusEl.textContent = "STREAMING";
+      } else if (state === "connected_poststop") {
+        btnConnect.disabled = true;
+        btnDisconnect.disabled = false;
+        btnStart.disabled = false;
+        btnStop.disabled = false; // per request: stop도 활성화
+        statusEl.textContent = "CONNECTED";
+      }
+
+      // Property sliders: enabled when WS connected
+      exposure.disabled = !connected;
+      focus.disabled = !connected;
+      gain.disabled = !connected;
+
+      // If fully disconnected, also clear the viewer.
+      if (!connected && viewerImg) {
+        viewerImg.src = "";
+      }
+    }
+
+    let uiState = "disconnected";
+    function setState(state) {
+      uiState = state;
+      applyState(uiState);
+    }
+
+    function sendJson(obj) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        log("[CLIENT] WS not open");
+        return;
+      }
+      const msg = JSON.stringify(obj);
+      ws.send(msg);
+      log("[CLIENT → SERVER] " + msg);
+    }
+
+    btnConnect.onclick = () => {
+      const url = `ws://${location.host}/ws/control`;
+      ws = new WebSocket(url);
+
+      ws.onopen = () => {
+        log("[CLIENT] WS opened");
+        setState("connected_idle");
+      };
+
+      ws.onmessage = (ev) => {
+        log("[SERVER → CLIENT] " + ev.data);
+        // When WS acks camera_start, THEN attach the MJPEG viewer.
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg && msg.type === "ack" && msg.action === "camera_start") {
+            if (pendingStartStream && viewerImg) {
+              viewerImg.src = `/mjpeg?ts=${Date.now()}`;
+              pendingStartStream = false;
+            }
+          }
+          if (msg && msg.type === "ack" && msg.action === "camera_stop") {
+            if (viewerImg) viewerImg.src = "";
+            pendingStartStream = false;
+            // remain connected; show post-stop state
+            if (ws) setState("connected_poststop");
+          }
+        } catch (e) {
+          // ignore non-JSON messages
+        }
+      };
+
+      ws.onerror = () => {
+        log("[CLIENT] WS error");
+      };
+
+      ws.onclose = () => {
+        log("[CLIENT] WS closed");
+        setState("disconnected");
+        if (viewerImg) viewerImg.src = "";
+        ws = null;
+      };
+    };
+
+    btnDisconnect.onclick = () => {
+      if (ws) ws.close();
+    };
+
+    btnStart.onclick = () => {
+      sendJson({ type: "camera_start" });
+      pendingStartStream = true;
+      setState("streaming");
+    };
+
+    btnStop.onclick = () => {
+      // Stop the HTTP stream immediately in the UI
+      if (viewerImg) viewerImg.src = "";
+      pendingStartStream = false;
+      sendJson({ type: "camera_stop" });
+      setState("connected_poststop");
+    };
+
+    exposure.oninput = () => {
+      expVal.textContent = exposure.value;
+      // 슬라이더가 움직일 때마다 서버에 값 전송(1단계에서는 ACK만 확인)
+      sendJson({ type: "set_exposure", value: Number(exposure.value) });
+    };
+
+    focus.oninput = () => {
+      focusVal.textContent = focus.value;
+      sendJson({ type: "set_focus", value: Number(focus.value) });
+    };
+
+    gain.oninput = () => {
+      gainVal.textContent = gain.value;
+      sendJson({ type: "set_gain", value: Number(gain.value) });
+    };
+    
+    setState("disconnected");
+  </script>
+</body>
+</html>
+

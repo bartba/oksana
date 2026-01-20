@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Camera Control</title>
+  <style>
+    html, body { height: 100%; }
+    body { font-family: sans-serif; margin: 0; padding: 8px; box-sizing: border-box; overflow: hidden; }
+
+    .row { margin: 6px 0; }
+    .controls-row, .props-row { display: flex; gap: 8px; align-items: center; flex-wrap: nowrap; overflow: auto; white-space: nowrap; }
+    .controls-row button { padding: 8px 12px; }
+    .props-row .prop { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+    .props-row input[type="range"] { width: 105px; }
+
+    /* Layout: no browser scroll; viewer fills remaining height */
+    #page { height: 100%; gap: 4px; display: flex; flex-direction: column; min-height: 0;}
+    #top { flex: 0 0 auto; }
+    #viewerSection { flex: 4.5 1 0; display: flex; flex-direction: column; min-height: 0; }
+    #viewerContainer { flex: 1 1 auto; min-height:0; }
+    #viewerBox { width: 100%; height: 100%; background: black; overflow: hidden; position: relative;}
+    #viewerOverlay{ position:absolute; inset:0; background: black; display:block;}
+    #viewer { width: 100%; height: 100%; object-fit: contain; }
+    #logWrap { flex: 1 1 0; min-height: 120px; display: flex; min-height: 0; width:100% }
+    #logWrap > .row { flex: 1 1 auto; margin: 0; min-height: 0; width:100%; display: flex;}
+    #log { width: 100%; height: 100%; box-sizing: border-box; resize:none; }
+  </style>
+</head>
+<body>
+  <div id="page">
+    <div id="top">
+      <div class="row controls-row">
+        <button id="btnConnect">Connect</button>
+        <button id="btnDisconnect" disabled>Disconnect</button>
+        <button id="btnStart" disabled>Camera Start</button>
+        <button id="btnStop" disabled>Camera Stop</button>
+      </div>
+    </div>
+    <div id="viewerSection">
+      <div class="row props-row"> 
+        <div class="prop">
+          <label>White Balance: <span id="wbVal">4400</span></label>
+          <input id="wbTemp" type="range" min="2000" max="7500" value="4400" disabled />
+        </div>        
+        <div class="prop">
+          <label>Exposure: <span id="expVal">600</span></label>
+          <input id="exposure" type="range" min="3" max="2047" value="600" disabled />
+        </div>        
+        <div class="prop">
+          <label>Gain: <span id="gainVal">0</span></label>
+          <input id="gain" type="range" min="0" max="255" value="0" disabled />
+        </div>
+        <div class="prop">
+          <label>Focus: <span id="focusVal">0</span></label>
+          <input id="focus" type="range" min="0" max="255" value="0" disabled />
+        </div>
+        <div class="prop">
+          <label>Zoom: <span id="zoomVal">100</span></label>
+          <input id="zoom" type="range" min="100" max="200" value="100" disabled />
+        </div>
+      </div>
+      <div id="viewerContainer">
+          <div id="viewerBox">
+              <img id="viewer"/>
+              <div id="viewerOverlay"></div>
+          </div>
+      </div>
+    </div>
+    <div id="logWrap">
+      <div class="row">
+        <textarea id="log" readonly></textarea>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let ws = null;
+    let pendingStartStream = false;
+
+    const btnConnect = document.getElementById("btnConnect");
+    const btnDisconnect = document.getElementById("btnDisconnect");
+    const btnStart = document.getElementById("btnStart");
+    const btnStop = document.getElementById("btnStop");
+
+    const exposure = document.getElementById("exposure");
+    const expVal = document.getElementById("expVal");
+    const focus = document.getElementById("focus");
+    const focusVal = document.getElementById("focusVal");
+    const gain = document.getElementById("gain");
+    const gainVal = document.getElementById("gainVal");
+    const wbTemp = document.getElementById("wbTemp");
+    const wbVal = document.getElementById("wbVal");
+    const zoom = document.getElementById("zoom");
+    const zoomVal = document.getElementById("zoomVal");
+
+    const logEl = document.getElementById("log");
+    const viewerImg = document.getElementById("viewer");
+    const viewerOverlay = document.getElementById("viewerOverlay");
+
+    function log(line) {
+      logEl.value += line + "\n";
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function applyState(state) {
+      // state: "disconnected" | "connected_idle" | "streaming" 
+      if (state === "disconnected") {
+        btnConnect.disabled = false;
+        btnDisconnect.disabled = true;
+        btnStart.disabled = true;
+        btnStop.disabled = true;
+        wbTemp.disabled = true;
+        exposure.disabled = true;
+        gain.disabled = true;
+        focus.disabled = true;
+        zoom.disabled = true;
+      } else if (state === "connected_idle") {
+        btnConnect.disabled = true;
+        btnDisconnect.disabled = false;
+        btnStart.disabled = false;
+        btnStop.disabled = true; 
+        wbTemp.disabled = true;
+        exposure.disabled = true;
+        gain.disabled = true;
+        focus.disabled = true;
+        zoom.disabled = true;
+      } else if (state === "streaming") {
+        btnConnect.disabled = true;
+        btnDisconnect.disabled = true;
+        btnStart.disabled = true;
+        btnStop.disabled = false;
+        wbTemp.disabled = false;
+        exposure.disabled = false;
+        gain.disabled = false;
+        focus.disabled = false;
+        zoom.disabled = false;
+      } 
+      if (viewerOverlay){
+        const showBlack = (state === "disconnected") || (state === "connected_idle");
+        viewerOverlay.style.display = showBlack? "block" : "none";
+      }
+    }
+
+    let uiState = "disconnected";
+    function setState(state) {
+      if(uiState === state) return;
+      uiState = state;
+      applyState(uiState);
+    }
+
+    function sendJson(obj) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        log("[CLIENT] WS not open");
+        return;
+      }
+      const msg = JSON.stringify(obj);
+      ws.send(msg);
+      log("[CLIENT → SERVER] " + msg);
+    }
+
+    btnConnect.onclick = () => {
+      const url = `ws://${location.host}/ws/control`;
+      ws = new WebSocket(url);
+
+      ws.onopen = () => {
+        log("[CLIENT] WS opened");
+        setState("connected_idle");
+      };
+
+      ws.onmessage = (ev) => {
+        log("[SERVER → CLIENT] " + ev.data);
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg && msg.type === "ack" && msg.action === "camera_start") {
+            if (pendingStartStream && viewerImg) {
+              viewerImg.src = `/mjpeg?ts=${Date.now()}`;
+              pendingStartStream = false;
+            }
+          }
+          if (msg && msg.type === "ack" && msg.action === "camera_stop") {
+            pendingStartStream = false;
+            if (ws) setState("connected_idle");
+          }
+        } catch (e) {}
+      };
+
+      ws.onerror = () => log("[CLIENT] WS error");
+
+      ws.onclose = () => {
+        log("[CLIENT] WS closed");
+        pendingStartStream = false;
+        setState("disconnected");
+        if (viewerImg) viewerImg.src = "";
+        ws = null;
+      };
+    };
+
+    btnDisconnect.onclick = () => {
+      if (ws) ws.close();
+    };
+
+    btnStart.onclick = () => {
+      sendJson({ type: "camera_start" });
+      pendingStartStream = true;
+      setState("streaming");
+    };
+
+    btnStop.onclick = () => {
+      pendingStartStream = false;
+      sendJson({ type: "camera_stop" });
+      setState("connected_idle");
+    };
+
+    exposure.oninput = () => {
+      expVal.textContent = exposure.value;
+      sendJson({ type: "set_exposure", value: Number(exposure.value) });
+    };
+
+    focus.oninput = () => {
+      focusVal.textContent = focus.value;
+      sendJson({ type: "set_focus", value: Number(focus.value) });
+    };
+
+    gain.oninput = () => {
+      gainVal.textContent = gain.value;
+      sendJson({ type: "set_gain", value: Number(gain.value) });
+    };
+
+    wbTemp.oninput = () => {
+      wbVal.textContent = wbTemp.value;
+      sendJson({ type: "set_white_balance_temperature", value: Number(wbTemp.value) });
+    };
+
+    zoom.oninput = () => {
+      zoomVal.textContent = zoom.value;
+      sendJson({ type: "set_zoom", value: Number(zoom.value) });
+    };
+
+    // Best-effort: when tab/window closes, close WS (server will stop camera on disconnect).
+    window.addEventListener("beforeunload", () => {
+      try { if (ws) ws.close(); } catch (e) {}
+    });
+
+    setState("disconnected");
+  </script>
+</body>
+</html>
